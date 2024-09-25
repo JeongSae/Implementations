@@ -3,12 +3,16 @@ import copy
 import time
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
 import torchvision
 import numpy as np
 import argparse
 import dataloaders.flowers102_dataloader as flowers102_dataloader
+import losses.losses
 import networks.VGG as VGG
+import losses
 from torch.utils import data
+from tqdm import tqdm
 from torchmetrics.classification import Accuracy, AUROC, F1Score, Recall, Precision
 
 torch.backends.cudnn.enabled = False
@@ -16,19 +20,20 @@ torch.backends.cudnn.enabled = False
 '''
 코드 수정 리스트
 
-1. Loss function ( Focal loss 구현 )
-2. Class weight, optimizer weight decay 파라미터 지정 추가
-3. Weight intialization 방법 선택
-4. Dataset 선택 ( mnist, cifar100, flower, imagenet 등 )
-5. Device, gpu parallel 선택 ( single, multi, DDP )
-6. report 출력 ( 그리드 형태로 예측, 예측 이미지, confusion matrix, roc-auc score, pr curve )
+1. Loss function ( Focal loss 구현, Losses 따로 구현 )
+2. Weight intialization 방법 선택 (모델 레이어 내 공통 적용)
+3. Dataset 선택 ( mnist, cifar100, flower, imagenet 등 다운로드 후 압축 풀기 or 폴더 내 압축 풀어 준비 )
+4. Device, gpu parallel 선택 ( single, multi, DDP )
+5. report 출력 ( 그리드 형태로 예측, 예측 이미지, confusion matrix, roc-auc score, pr curve )
+6. Evaluation 코드 추가
 
 
 추가 기능 함수 리스트
 
 1. Multi-Scale Crop function (Optional) 추가 -> IPYNB 구현 완료, 추후 Test 단계 적용 예정
 2. Dense Evaluation function (Optional) 추가
-3. 점진적 학습 / Transfer Learning (Optional) 추가
+3. VGG 전체 점진적 학습 / Transfer Learning (Optional) 추가
+4. 데이터 증강 파라미터화 + 기본 데이터 증강 추가
 
 '''
 
@@ -36,11 +41,11 @@ def train_model(model, criterion, optimizer, num_epochs, decay_step, num_class, 
     since = time.time()
 
     # metrics
-    acc = Accuracy(task='multiclass', num_classes=num_class, average='micro')
-    auroc = AUROC(task='multiclass', num_classes=num_class, average='macro')
-    f1 = F1Score(task='multiclass', num_classes=num_class, average='micro')
-    recall = Recall(task='multiclass', num_classes=num_class, average='micro')
-    precision = Precision(task='multiclass', num_classes=num_class, average='micro')
+    acc = Accuracy()
+    auroc = AUROC(task="multiclass", num_classes=num_class)
+    f1 = F1Score()
+    recall = Recall()
+    precision = Precision()
     
     best_model_wts = copy.deepcopy(model.state_dict())
     best_loss = 10000.0
@@ -53,18 +58,18 @@ def train_model(model, criterion, optimizer, num_epochs, decay_step, num_class, 
         print(f'Epoch {epoch} / {num_epochs - 1}')
         print('-' * 10)
 
-        # 각 에폭(epoch)은 학습 단계와 검증 단계를 갖습니다.
+        # Select Phase
         for phase in ['train', 'valid']:
             if phase == 'train':
-                model.train()  # 모델을 학습 모드로 설정
+                model.train()
             else:
-                model.eval()   # 모델을 평가 모드로 설정
+                model.eval()
 
             # running score
             running_loss, running_acc, running_auroc, running_f1, running_recall, running_precision = 0.0, 0.0, 0.0, 0.0, 0.0, 0.0
 
             # 데이터를 반복
-            for inputs, labels in dataloader[phase]:
+            for inputs, labels in tqdm(dataloader[phase]):
 
                 # zero the parameter gradients
                 optimizer.zero_grad()
@@ -163,31 +168,38 @@ def main(config):
     valid_dataset = flowers102_dataloader.ImageFolder(config.dataset_path, config.dataset_target_path, config.split_dataset_id, config.img_size, 'valid')
 
     # Define Dataloader
-    train_dataloader = data.DataLoader(dataset=train_dataset, batch_size=2, shuffle=False, num_workers=4)
-    valid_dataloader = data.DataLoader(dataset=valid_dataset, batch_size=2, shuffle=False, num_workers=4)
+    train_dataloader = data.DataLoader(dataset=train_dataset, batch_size=config.batch_size, shuffle=False, num_workers=4)
+    valid_dataloader = data.DataLoader(dataset=valid_dataset, batch_size=config.batch_size, shuffle=False, num_workers=4)
     loader = {'train' : train_dataloader, 'valid' : valid_dataloader}
     dataset_sizes = {x: len(loader[x]) for x in ['train', 'valid']}
     
     # Define Optimizer & Loss function
     if config.optim == 'SGD':
-        optimizer = torch.optim.SGD(list(model.parameters()), config.lr, 0.9)
+        optimizer = torch.optim.SGD(list(model.parameters()), config.lr, 0.9, weight_decay=config.weight_decay)
     elif config.optim == 'Adam':
-        optimizer = torch.optim.Adam(list(model.parameters()), config.lr, [0.9, 0.999])
+        optimizer = torch.optim.Adam(list(model.parameters()), config.lr, [0.9, 0.999], weight_decay=config.weight_decay)
     elif config.optim == 'AdamW':
-        optimizer = torch.optim.AdamW(list(model.parameters()), config.lr, [0.9, 0.999])
+        optimizer = torch.optim.AdamW(list(model.parameters()), config.lr, [0.9, 0.999], weight_decay=config.weight_decay)
 
     if config.num_class == 1:
-        criterion = torch.nn.BCEWithLogitsLoss()
+        if config.loss_function == 'BCE':
+            criterion = torch.nn.BCEWithLogitsLoss()
+        elif config.loss_function == 'FOCAL':
+            criterion = losses.losses.BinaryFocalLoss()
     else:
-        criterion = torch.nn.CrossEntropyLoss()
+        if config.loss_function == 'CE':
+            criterion = torch.nn.CrossEntropyLoss()
+        elif config.loss_function == 'FOCAL':
+            criterion = losses.losses.FocalLoss()
 
     # Training
     trained_model = train_model(model, criterion, optimizer, config.num_epochs, config.num_epochs_decay, config.num_class,
                                 loader, dataset_sizes, config.lr, config.lr_decay, config.early_stopping_rounds, device, config.save_state_path, config.model)
 
-    pass
+    print('Done.')
 
 if __name__ == '__main__':
+    # parser
     parser = argparse.ArgumentParser()
     parser.add_argument('--model', type=str, default='vgg16_advanced', help='vgg11 ~ vgg19_advanced')
     parser.add_argument('--img_size', type=int, default=112)
@@ -197,12 +209,19 @@ if __name__ == '__main__':
     parser.add_argument('--early_stopping_rounds', type=int, default=10)
     parser.add_argument('--lr_decay', type=float, default=0.0001)
     parser.add_argument('--lr', type=float, default=0.001)
-    parser.add_argument('--optim', type=float, default='SGD')
+    parser.add_argument('--batch_size', type=int, default=4)
+    parser.add_argument('--optim', type=str, default='SGD')
     parser.add_argument('--num_class', type=int, default=102)
     parser.add_argument('--drop_rate', type=float, default=0.5)
     parser.add_argument('--dataset_path', type=str, default='datasets/flowers-102/jpg')
     parser.add_argument('--dataset_target_path', type=str, default='datasets/flowers-102/imagelabels.mat')
     parser.add_argument('--split_dataset_id', type=str, default='datasets/flowers-102/setid.mat')
     parser.add_argument('--save_state_path', type=str, default='runs')
+    parser.add_argument('--weight_decay', type=float, default=0.0001)
+    parser.add_argument('--loss_function', type=str, default='CE', help='BCE, CE, FOCAL')
+    parser.add_argument('--focal_loss_gamma', type=float, default=2.0)
+    parser.add_argument('--focal_loss_alpha', type=float, default=0.25)
     config = parser.parse_args()
+
+    # main code
     main(config)
